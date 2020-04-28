@@ -1,3 +1,4 @@
+% layout "wrapper.mt", title => "Hello";
 this is a testdd
 <%= $test %>
 ggg
@@ -7,6 +8,7 @@ sdfsdf
 sdfsdf
 <% end %>
 
-<% my $block = begin %>
-  Some data!
-<% end %>
+
+% content 'test' => begin
+this is content <%= $test %>
+% end;
