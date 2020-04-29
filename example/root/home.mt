@@ -1,4 +1,5 @@
 % layout "wrapper.mt", title => "Hello";
+%= include "navbar.mt", myapp => "Example";
 this is a testdd
 <%= $test %>
 ggg
@@ -10,5 +11,5 @@ sdfsdf
 
 
 % content 'test' => begin
-this is content <%= $test %>
+this <b>is</b> content <%= $test %>
 % end;
