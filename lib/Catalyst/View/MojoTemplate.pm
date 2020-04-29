@@ -2,6 +2,7 @@ package Catalyst::View::MojoTemplate;
 
 use Moo;
 use Mojo::Template;
+use Mojo::ByteStream qw(b);
 
 extends 'Catalyst::View';
 
@@ -78,15 +79,31 @@ sub COMPONENT {
   return $class->new($app, $args);
 }
 
+sub ACCEPT_CONTEXT {
+  my ($self, $c, @args) = @_;
+  if(@args) {
+    my ($template, %args) = @args;
+    my %template_args = $self->template_vars($c);
+    my $output = $self->render($c, $template, +{%template_args, %args});
+    $self->set_response_from($c,$output);
+    return $self;
+  } else {
+    return $self;
+  }
+}
+
+sub set_response_from {
+  my ($self, $c, $output) = @_;
+  $c->response->content_type($self->content_type) unless $c->response->content_type;
+  $c->response->body($output)
+}
+
 sub process {
   my ($self, $c) = @_;
-
   my $template = $self->find_template($c); 
   my %template_args = $self->template_vars($c);
   my $output = $self->render($c, $template, \%template_args);
-
-  $c->response->content_type($self->content_type) unless $c->response->content_type;
-  $c->response->body($output);
+  $self->set_response_from($c, $output);
 
   return 1;
 }
@@ -96,7 +113,6 @@ sub find_template {
   my $template = $c->stash->{template}
     ||  $c->action . $self->template_extension;
 
- 
   unless (defined $template) {
     $c->log->debug('No template specified for rendering') if $c->debug;
     return 0;
@@ -105,24 +121,45 @@ sub find_template {
   return $template;
 }
 
+# Its possible we need to do this upfront caching at init time.  I think
+# This way we end up building a new cache when a fork is initialized.
+
 our %CACHE = ();
 sub render {
   my ($self, $c, $template, $template_args) = @_;
+  my $output = $self->render_template($c, $template, $template_args);
+
+  if(my $layout = delete $c->stash->{'view.layout'}) {
+    $c->stash->{'view.content'}->{main} = sub { Mojo::ByteStream->new($output) };
+    $output = $self->render($c, $layout, +{ $self->template_vars($c) });
+  }
+
+  $c->response->content_type('text/plain') if ref $output;
+
+  return $output;
+}
+
+sub render_template {
+  my ($self, $c, $template, $template_args) = @_;
   $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
 
-  my $local_mojo_template = $CACHE{$template} ||= do {
+  my $local_mojo_template = $CACHE{$template} = do {
     my $mojo_template = $self->_mojo_template;
     my $local_mojo_template = bless +{%$mojo_template}, ref($mojo_template);
 
     $local_mojo_template->name($template);
-    my ($namespace_part) = localtime;
-    $local_mojo_template->namespace( ref($self) .'::'. $namespace_part );
+    my $namespace_part = $template;
+    $namespace_part =~s/\//::/g;
+    $namespace_part =~s/\.mt$//;
+    $local_mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part );
 
-    my %helpers = $self->helpers;
+    my %helpers = $self->get_helpers;
     foreach my $helper(keys %helpers) {
-      eval qq[ package ${\$local_mojo_template->namespace}; \nsub $helper { \$self->helpers('$helper')->(\$self, \$c, \@_) }\n ];
+      eval qq[
+        package ${\$local_mojo_template->namespace};
+        sub $helper { \$self->get_helpers('$helper')->(\$self, \$c, \@_) }
+      ]; die $@ if $@;
     }
-
 
     my $template_contents = $self->path_base->file($template)->slurp;
 
@@ -130,8 +167,7 @@ sub render {
     $local_mojo_template;
   };
 
-  my $output = $local_mojo_template
-    ->process($template_args);
+  my $output = $local_mojo_template->process($template_args);
 
   return $output;
 }
@@ -150,12 +186,29 @@ sub template_vars {
   return %template_args;
 }
 
-sub helpers {
+sub get_helpers {
   my ($self, $helper) = @_;
   my %helpers = (
     test => sub {
       my ($self, $c, @args) = @_;
       return $c->action;
+    },
+    layout => sub {
+      my ($self, $c, $template, %args) = @_;
+      $c->stash('view.layout' => $template);
+      $c->stash(%args) if %args;
+    },
+    include => sub {
+      my ($self, $c, $template, %args) = @_;
+      my %template_args = $self->template_vars($c);
+      return b($self->render_template($c, $template, +{ %template_args, %args }));
+    },
+    content => sub {
+      my ($self, $c, $name, $block) = @_;
+      $name ||= 'main';
+      $c->log->debug("content name is '$name'") if $c->debug;
+      $c->stash->{'view.content'}->{$name} = $block if $block;
+      return $c->stash->{'view.content'}->{$name}->();
     },
     %{ $self->helpers || +{} },
   );
@@ -243,3 +296,39 @@ This library is free software; you can redistribute it and/or modify it under
 the same terms as Perl itself.
 
 =cut
+
+__END__
+
+our %CACHE = ();
+sub render {
+  my ($self, $c, $template, $template_args) = @_;
+  $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
+
+  my $local_mojo_template = $CACHE{$template} ||= do {
+    my $mojo_template = $self->_mojo_template;
+    my $local_mojo_template = bless +{%$mojo_template}, ref($mojo_template);
+
+    $local_mojo_template->name($template);
+    my ($namespace_part) = localtime;
+    $local_mojo_template->namespace( ref($self) .'::'. $namespace_part );
+
+    my %helpers = $self->helpers;
+    foreach my $helper(keys %helpers) {
+      eval qq[
+        package ${\$local_mojo_template->namespace};
+        sub $helper { \$self->helpers('$helper')->(\$self, \$c, \@_) }
+      ]; die $@ if $@;
+    }
+
+    my $template_contents = $self->path_base->file($template)->slurp;
+
+    $local_mojo_template = $local_mojo_template->parse($template_contents);
+    $local_mojo_template;
+  };
+
+  my $output = $local_mojo_template
+    ->process($template_args);
+
+  return $output;
+}
+
