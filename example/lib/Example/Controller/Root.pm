@@ -14,8 +14,7 @@ sub root :Chained(/) PathPart('') CaptureArgs(0) {}
 
   sub profile :Chained(root) PathPart(profile) Args(0) {
     my ($self, $c) = @_;
-    return $c->view('HTML' => 'profile.mt', aaa=> 100);
-    # should allow $c->view(+{foo=>'bar'}) as well (get default view and deault template name
+    $c->view('HTML' => 'profile.mt', +{ aaa=> 100 });
   }
 
 sub end : ActionClass('RenderView') {}

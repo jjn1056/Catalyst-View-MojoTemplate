@@ -24,9 +24,12 @@ has trim_mark => (is=>'ro', required=>1, default=>'%');
 has tag_start=> (is=>'ro', required=>1, default=>'<%');
 has tag_end => (is=>'ro', required=>1, default=>'%>');
 has ['name', 'namespace'] => (is=>'rw');
-has content_type => (is=>'ro', required=>1, default=>sub { 'text/html' });
+
 has template_extension => (is=>'ro', required=>1, default=>sub { '.mt' });
+
+has content_type => (is=>'ro', required=>1, default=>sub { 'text/html' });
 has helpers => (is=>'ro', predicate=>'has_helpers');
+has layout => (is=>'ro', predicate=>'has_layout');
 
 has _mojo_template => (
   is => 'ro',
@@ -81,10 +84,14 @@ sub COMPONENT {
 
 sub ACCEPT_CONTEXT {
   my ($self, $c, @args) = @_;
+  $c->stash->{'view.layout'} = $self->layout
+    if $self->has_layout && !exists($c->stash->{'view.layout'});
+
   if(@args) {
-    my ($template, %args) = @args;
-    my %template_args = $self->template_vars($c);
-    my $output = $self->render($c, $template, +{%template_args, %args});
+    my %template_args = %{ pop(@args)||+{} };
+    my $template = shift @args || $self->find_template($c);
+    my %global_args = $self->template_vars($c);
+    my $output = $self->render($c, $template, +{%global_args, %template_args});
     $self->set_response_from($c,$output);
     return $self;
   } else {
@@ -95,7 +102,7 @@ sub ACCEPT_CONTEXT {
 sub set_response_from {
   my ($self, $c, $output) = @_;
   $c->response->content_type($self->content_type) unless $c->response->content_type;
-  $c->response->body($output)
+  $c->response->body($output) unless $c->response->body;
 }
 
 sub process {
@@ -121,24 +128,37 @@ sub find_template {
   return $template;
 }
 
-# Its possible we need to do this upfront caching at init time.  I think
-# This way we end up building a new cache when a fork is initialized.
-
-our %CACHE = ();
 sub render {
   my ($self, $c, $template, $template_args) = @_;
   my $output = $self->render_template($c, $template, $template_args);
 
-  if(my $layout = delete $c->stash->{'view.layout'}) {
-    $c->stash->{'view.content'}->{main} = sub { Mojo::ByteStream->new($output) };
-    $output = $self->render($c, $layout, +{ $self->template_vars($c) });
+  if(ref $output) {
+    # Its a Mojo::Exception;
+    $c->response->content_type('text/plain');
+    $c->response->body($output);
+    return $output;
   }
 
-  $c->response->content_type('text/plain') if ref $output;
+  return $self->apply_layout($c, $output);
+}
 
+sub apply_layout {
+  my ($self, $c, $output) = @_;
+  if(my $layout = $self->find_layout($c)) {
+    $c->log->debug(qq/Applying layout "$layout"/) if $c->debug;
+    $c->stash->{'view.content'}->{main} = sub { b($output) };
+    $output = $self->render($c, $layout, +{ $self->template_vars($c) });
+  }
   return $output;
 }
 
+sub find_layout {
+  my ($self, $c) = @_;
+  return delete $c->stash->{'view.layout'} if exists $c->stash->{'view.layout'};
+  return;
+}
+
+our %CACHE = ();
 sub render_template {
   my ($self, $c, $template, $template_args) = @_;
   $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
@@ -153,18 +173,13 @@ sub render_template {
     $namespace_part =~s/\.mt$//;
     $local_mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part );
 
-    my %helpers = $self->get_helpers;
-    foreach my $helper(keys %helpers) {
-      eval qq[
-        package ${\$local_mojo_template->namespace};
-        sub $helper { \$self->get_helpers('$helper')->(\$self, \$c, \@_) }
-      ]; die $@ if $@;
-    }
+    $self->inject_helpers($c,$local_mojo_template->namespace);
 
-    my $template_contents = $self->path_base->file($template)->slurp;
+    my $template_full_path = $self->path_base->file($template);
+    $c->log->debug(qq/Found template at path "$template_full_path"/) if $c->debug;
+    my $template_contents = $template_full_path->slurp;
 
-    $local_mojo_template = $local_mojo_template->parse($template_contents);
-    $local_mojo_template;
+    $local_mojo_template->parse($template_contents);
   };
 
   my $output = $local_mojo_template->process($template_args);
@@ -172,12 +187,28 @@ sub render_template {
   return $output;
 }
 
+# Its possible we need to do this upfront caching at init time.  I think
+# This way we end up building a new cache when a fork is initialized.
+
+sub inject_helpers {
+  my ($self, $c, $namespace) = @_;
+  $c->log->debug(qq/Injecting Helpers into "$namespace"/) if $c->debug;
+  my %helpers = $self->get_helpers;
+  foreach my $helper(keys %helpers) {
+    $c->log->debug(qq/Injecting helper "$helper"/) if $c->debug;
+    eval qq[
+      package $namespace;
+      sub $helper { \$self->get_helpers('$helper')->(\$self, \$c, \@_) }
+    ]; die $@ if $@;
+  }
+}
+
 sub template_vars {
   my ($self, $c) = @_;
   my %template_args = (
     c => $c,
     base => $c->req->base,
-    name => $c->config->{name},
+    name => $c->config->{name} ||'',
     model => $c->model,
     self => $self,
     %{$c->stash||+{}},
@@ -186,16 +217,13 @@ sub template_vars {
   return %template_args;
 }
 
-sub get_helpers {
-  my ($self, $helper) = @_;
-  my %helpers = (
-    test => sub {
-      my ($self, $c, @args) = @_;
-      return $c->action;
-    },
+sub default_helpers {
+  my $self = shift;
+  return (
     layout => sub {
       my ($self, $c, $template, %args) = @_;
       $c->stash('view.layout' => $template);
+      #$c->stash->{'view.content'}
       $c->stash(%args) if %args;
     },
     include => sub {
@@ -204,18 +232,24 @@ sub get_helpers {
       return b($self->render_template($c, $template, +{ %template_args, %args }));
     },
     content => sub {
-      my ($self, $c, $name, $block) = @_;
+      my ($self, $c, $name, $proto) = @_;
       $name ||= 'main';
-      $c->log->debug("content name is '$name'") if $c->debug;
-      $c->stash->{'view.content'}->{$name} = $block if $block;
-      return $c->stash->{'view.content'}->{$name}->();
+      $c->stash->{'view.content'}->{$name} = $proto if $proto;
+
+      my $value = $c->stash->{'view.content'}->{$name}
+        || die "No content key named '$name'";
+
+      return (ref($value)||'') eq 'CODE' ? $value->() : $value;
     },
-    %{ $self->helpers || +{} },
   );
+}
+
+sub get_helpers {
+  my ($self, $helper) = @_;
+  my %helpers = ($self->default_helpers, %{ $self->helpers || +{} });
 
   return $helpers{$helper} if defined $helper;
   return %helpers;
-
 }
 
 1;
@@ -249,25 +283,15 @@ those docs if you are not familiar.
 
 =head2 auto_escape
 
-True by default.  Automatically escapes template render of variables to help prevent
-HTML injection attacks.
-
 =head2 append
 
 =head2 prepend
-
-Appends or prepends Perl code to the compiled template.  
 
 =head2 capture_start
 
 =head2 capture_end
 
-String used to mark the start and end of a capture block.  Defaults to 'start', 'end'.
-
 =head2 encoding
-
-Encoding of the template files.  Please note that this is only applied to decoding the
-template files, it is not used to encode the rendered templates.  Defaults to UTF-8.
 
 =head2 comment_mark
 
@@ -279,10 +303,24 @@ template files, it is not used to encode the rendered templates.  Defaults to UT
 
 =head2 replace_mark
 
+These are just pass thru to L<Mojo::Template>.  See that for details
+
+=head2 content_type
+
+The HTTP content-type that is set in the response unless it is already set.
+
+=head2 helpers
+
+An arrayref of helper functions
+
+=head2 layout
+
+Set a default layout which will be used if none are defined.  Optional.
 
 =head1 AUTHOR
  
     jnap - John Napiorkowski (cpan:JJNAPIORK)  L<email:jjnapiork@cpan.org>
+    With tremendous thanks to SRI and the Mojolicous team!
 
 =head1 SEE ALSO
  
@@ -296,39 +334,3 @@ This library is free software; you can redistribute it and/or modify it under
 the same terms as Perl itself.
 
 =cut
-
-__END__
-
-our %CACHE = ();
-sub render {
-  my ($self, $c, $template, $template_args) = @_;
-  $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
-
-  my $local_mojo_template = $CACHE{$template} ||= do {
-    my $mojo_template = $self->_mojo_template;
-    my $local_mojo_template = bless +{%$mojo_template}, ref($mojo_template);
-
-    $local_mojo_template->name($template);
-    my ($namespace_part) = localtime;
-    $local_mojo_template->namespace( ref($self) .'::'. $namespace_part );
-
-    my %helpers = $self->helpers;
-    foreach my $helper(keys %helpers) {
-      eval qq[
-        package ${\$local_mojo_template->namespace};
-        sub $helper { \$self->helpers('$helper')->(\$self, \$c, \@_) }
-      ]; die $@ if $@;
-    }
-
-    my $template_contents = $self->path_base->file($template)->slurp;
-
-    $local_mojo_template = $local_mojo_template->parse($template_contents);
-    $local_mojo_template;
-  };
-
-  my $output = $local_mojo_template
-    ->process($template_args);
-
-  return $output;
-}
-
