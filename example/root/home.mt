@@ -7,3 +7,9 @@ ggg
 % content 'test' => begin
 this <b>is</b> content <%= $test %>
 % end;
+
+<hr>
+
+%= form $person, begin
+  %= input 'name';
+% end
