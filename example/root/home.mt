@@ -13,3 +13,6 @@ this <b>is</b> content <%= $test %>
 %= form $person, begin
   %= input 'name';
 % end
+% use Devel::Dwarn; Dwarn $c->stash; warn $c;
+
+
