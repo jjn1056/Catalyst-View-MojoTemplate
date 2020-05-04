@@ -32,10 +32,3 @@ sub end : ActionClass('RenderView') {}
 
 __PACKAGE__->config(namespace=>'');
 __PACKAGE__->meta->make_immutable;
-
-__END__
-
-  %= fields_for 'state', begin
-    %= input 'name';
-  % end
-

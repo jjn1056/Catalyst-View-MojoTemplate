@@ -95,7 +95,6 @@ sub ACCEPT_CONTEXT {
     my %global_args = $self->template_vars($c);
     my $output = $self->render($c, $template, +{%global_args, %template_args});
     $self->set_response_from($c,$output);
-
     return $self;
   } else {
     return $self;
@@ -184,26 +183,23 @@ sub render_template {
   };
 
   my $ns = $local_mojo_template->namespace;
-  $self->inject_context($c, $ns);
-  $self->inject_helpers($c, $ns) unless $self->{"__helper_${ns}"};
-  $self->{"__helper_${ns}"}++;
+  
+  no strict 'refs';
+  no warnings 'redefine';
+  local *{"${ns}::_C"} = sub { $c };
+
+  unless($self->{"__helper_${ns}"}) {
+    $self->inject_helpers($c, $ns);
+    $self->{"__helper_${ns}"}++;
+  }
 
   return my $output = $local_mojo_template->process($template_args);
 }
 
-sub inject_context {
-  my($self, $c, $namespace) = @_;
-  no strict 'refs';
-  no warnings 'redefine';
-  local *{"${namespace}::_C"} = sub {$c};
-}
-
 sub inject_helpers {
   my ($self, $c, $namespace) = @_;
-  $c->log->debug(qq/Injecting Helpers into "$namespace"/) if $c->debug;
   my %helpers = $self->get_helpers;
   foreach my $helper(keys %helpers) {
-    $c->log->debug(qq/Injecting helper "$helper"/) if $c->debug;
     eval qq[
       package $namespace;
       sub $helper { \$self->get_helpers('$helper')->(\$self, _C, \@_) }
@@ -235,14 +231,14 @@ sub default_helpers {
     wrapper => sub {
       my ($self, $c, $template, @args) = @_;
       $c->stash->{'view.content'}->{main} = pop @args;
-      my %local_args = @args;
+      my %args = @args;
       my %global_args = $self->template_vars($c);
-      return b($self->render_template($c, $template, +{ %global_args, %local_args }));
+      return b($self->render_template($c, $template, +{ %global_args, %args }));
     },
     include => sub {
       my ($self, $c, $template, %args) = @_;
-      my %template_args = $self->template_vars($c);
-      return b($self->render_template($c, $template, +{ %template_args, %args }));
+      my %global_args = $self->template_vars($c);
+      return b($self->render_template($c, $template, +{ %global_args, %args }));
     },
     content => sub {
       my ($self, $c, $name, $proto) = @_;
@@ -253,28 +249,6 @@ sub default_helpers {
         || die "No content key named '$name'";
 
       return (ref($value)||'') eq 'CODE' ? $value->() : $value;
-    },
-    form => sub {
-      my ($self, $c, $model, @proto) = @_;
-      my ($inner, %attrs) = (pop(@proto), @proto);
-      my $attrs =  join ' ', map { "$_='$attrs{$_}'"} keys %attrs;
-
-      LOCAL_TO_FORM: {
-        # Do we need a stack so we can refer to the parent or not...?
-        my @model_stack = (
-          (exists($c->stash->{'view.form.model'}) ? $c->stash->{'view.form.model'} : () ),
-          $model,
-        );
-        local $c->stash->{'view.form.model'} = $model;
-
-      return b("<form $attrs>@{[$inner->()]}</form>");
-      }
-    },
-    input => sub {
-      my ($self, $c, $name, %attrs) = @_;
-      $attrs{value} = $c->stash->{'view.form.model'}->{$name};
-      my $attrs =  join ' ', map { "$_='$attrs{$_}'"} keys %attrs;
-      return b("<input $attrs/>");
     },
   );
 }
@@ -295,20 +269,88 @@ Catalyst::View::MojoTemplate - Use Mojolicious Templates for your Catalyst View
 
 =head1 SYNOPSIS
 
+    package Example::View::HTML;
+
+    use Moose;
+    extends 'Catalyst::View::MojoTemplate';
+
+    __PACKAGE__->config(helpers => +{
+      now => sub {
+        my ($self, $c, @args) = @_;
+        return localtime;
+      },
+    });
+
+    __PACKAGE__->meta->make_immutable;
+
+Then called from a controller:
+
+    package Example::Controller::Root;
+
+    use Moose;
+    use MooseX::MethodAttributes;
+
+    extends 'Catalyst::Controller';
+
+    sub root :Chained(/) PathPart('') CaptureArgs(0) { } 
+
+      sub home :Chained(root) PathPart('') Args(0) {
+        my ($self, $c) = @_;
+        $c->stash(status => $c->model('Status'));
+      }
+
+      sub profile :Chained(root) PathPart(profile) Args(0) {
+        my ($self, $c) = @_;
+        $c->view('HTML' => 'profile.mt', +{ 
+          me => $c->user,
+        });
+      }
+
+    sub end : ActionClass('RenderView') {}
+
+    __PACKAGE__->config(namespace=>'');
+    __PACKAGE__->meta->make_immutable;
 
 =head1 DESCRIPTION
 
-Use L<Mojolicous::Template> as your L<Catalyst> view.  While ths might strike some as
-odd, if you are using both L<Catalyst> and L<Mojolicous> you might like the option to
+Use L<Mojo::Template> as your L<Catalyst> view.  While ths might strike some as
+odd, if you are using both L<Catalyst> and L<Mojolicious> you might like the option to
 share the template code and expertise.  You might also just want to use a Perlish
 template system rather than a dedicated mini language (such as L<Xslate>) since you
 already know Perl and don't have the time or desire to become an expert in another
 system.
 
 This works just like many other L<Catalyst> views.  It will load and render a template
-based on either the current action private name or a stash variable.  It will use the
-stash to populate variables in the template.  It also offers an alternative interface
-that lets you set a template in the actual call to the view, and pass variables.
+based on either the current action private name or a stash variable called C<template>.
+It will use the stash to populate variables in the template.  It also offers an alternative
+interface that lets you set a template in the actual call to the view, and pass variables.
+
+By default we look for templates in C<$APPHOME/root> which is the standard default location
+for L<Catalyst> templates.
+
+Also like a lot of other template systems you can define helper methods which are injected
+into your template and can take parameters (including text blocks).
+
+The intention here is to try and make this as similar to how L<Mojo::Template> is used
+in L<Mojolicious> so that people that need to work in both frameworks could in theory use
+this view in L<Catalyst> and be able to switch between the two with less trouble (at least
+for doing view development).  To that end we've added some default helpers that hopefully
+work the same way as they do in L<Mojolicious>.  These are helpers for template layouts
+and includes as well as for sharing data between them.  We've also added a 'wrapper'
+helper because the author has found that feature of Template::Toolkit (L<Template>) to be so
+useful he would have a hard time living without it.  We did not include the L<Mojolicious>
+tag helpers but there's no reason those could not be added as an add on role at a later
+date should people take an interest in this thing.
+
+There's an example of sorts in the C<example> directory of the module distribution.  You can
+start the example server with the following command:
+
+     perl -Ilib -I example/lib/ example/lib/Example/Server.pm
+
+B<NOTE> Warning, this is an early access module and I reserve the right to make breaking
+changes if it turns out I totally confused how L<Mojolicious> works.  There's actually
+not a ton of code here since its just a thin wrapper over L<Mojo::Template> so you should
+be confortable looking that over and coping if there's issues.
 
 =head1 CONFIGURATION
 
@@ -346,16 +388,71 @@ The HTTP content-type that is set in the response unless it is already set.
 
 =head2 helpers
 
-An arrayref of helper functions
+A hashref of helper functions.  For example:
+
+    __PACKAGE__->config(helpers=>+{
+      now => sub {
+        my ($self, $c, @args) = @_;
+        return localtime;
+      },
+    );
+
+All arguments are passed from the template.  If you are building a block
+helper then the last argument will be a coderef to the enclosed block.  You
+may wish to view the source code around the default helpers for more examples of
+this.
 
 =head2 layout
 
 Set a default layout which will be used if none are defined.  Optional.
 
+=head1 HELPERS
+
+The following is a list of the default helpers.
+
+=head2 layout
+
+    % layout "layout.mt", title => "Hello";
+    <h1>The Awesome new Content</h1>
+    <p>You are doomed to discover you can never recover from the narcoleptic
+    country in which you once stood, where the fires alway burning but there's
+    never enough wood</p>
+
+C<layout> sets a global template wrapper around your content.  Arguments passed
+get merged into the stash and are available to the layout.  The output of your
+template is placed into the 'main' content block.  See L<Mojolicious::Plugin::DefaultHelpers/layout>
+for more.
+
+=head2 include
+
+See L<Mojolicious::Plugin::DefaultHelpers/include>
+
+=head2 content
+
+See L<Mojolicious::Plugin::DefaultHelpers/content>
+
+=head2 wrapper
+
+Similar to the C<layout> helper, the C<wrapper> helper wraps the contained content
+inside a another template.  However unlike C<layout> you can have more than one
+C<wrapper> in your template.  Example:
+
+    %= wrapper "wrapper.mt", header => "The Story Begins...", begin
+      <p>
+        The story begins like many others; something interesting happend to someone
+        while sone other sort of interesting thing was happening all over.  And then
+        there wre monkeys.  Monkeys are great, you ever get stuck writing a story I
+        really recommend adding monkeys since they help the more boring story.
+      </p>
+    %end
+
+This works similar to the WRAPPER directive in Template::Toolkit, if you are familiar
+with that system.
+
 =head1 AUTHOR
  
     jnap - John Napiorkowski (cpan:JJNAPIORK)  L<email:jjnapiork@cpan.org>
-    With tremendous thanks to SRI and the Mojolicous team!
+    With tremendous thanks to SRI and the Mojolicious team!
 
 =head1 SEE ALSO
  

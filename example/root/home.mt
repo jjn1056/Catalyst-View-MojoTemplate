@@ -14,5 +14,6 @@ this <b>is</b> content <%= $test %>
   %= input 'name';
 % end
 
-% warn '.template.',$c;
+%= now;
+%= `ps -o rss= -p $$`
 
