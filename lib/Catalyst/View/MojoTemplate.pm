@@ -25,41 +25,34 @@ has tag_start=> (is=>'ro', required=>1, default=>'<%');
 has tag_end => (is=>'ro', required=>1, default=>'%>');
 has ['name', 'namespace'] => (is=>'rw');
 
-has template_extension => (is=>'ro', required=>1, default=>sub { '.mt' });
+has template_extension => (is=>'ro', required=>1, default=>sub { '.ep' });
 
 has content_type => (is=>'ro', required=>1, default=>sub { 'text/html' });
 has helpers => (is=>'ro', predicate=>'has_helpers');
 has layout => (is=>'ro', predicate=>'has_layout');
 
-has _mojo_template => (
-  is => 'ro',
-  init_arg => undef,
-  lazy => 1,
-  builder => '_build_mojo_template',
-);
+sub build_mojo_template {
+  my $self = shift;
+  my $prepend = 'my $c = _C;' . $self->prepend;
+  my %args = (
+    auto_escape => $self->auto_escape,
+    append => $self->append,
+    capture_end => $self->capture_end,
+    capture_start => $self->capture_start,
+    comment_mark => $self->comment_mark,
+    encoding => $self->encoding,
+    escape_mark => $self->escape_mark,
+    expression_mark => $self->expression_mark,
+    line_start => $self->line_start,
+    prepend => $prepend,
+    trim_mark => $self->trim_mark,
+    tag_start => $self->tag_start,
+    tag_end => $self->tag_end,
+    vars => 1,
+  );
 
-  sub _build_mojo_template {
-    my $self = shift;
-    my $prepend = 'my $c = _C;' . $self->prepend;
-    my %args = (
-      auto_escape => $self->auto_escape,
-      append => $self->append,
-      capture_end => $self->capture_end,
-      capture_start => $self->capture_start,
-      comment_mark => $self->comment_mark,
-      encoding => $self->encoding,
-      escape_mark => $self->escape_mark,
-      expression_mark => $self->expression_mark,
-      line_start => $self->line_start,
-      prepend => $prepend,
-      trim_mark => $self->trim_mark,
-      tag_start => $self->tag_start,
-      tag_end => $self->tag_end,
-      vars => 1,
-    );
-
-    return Mojo::Template->new(%args);
-  }
+  return Mojo::Template->new(%args);
+}
 
 
 has path_base => (
@@ -94,7 +87,7 @@ sub ACCEPT_CONTEXT {
     my $template = shift @args || $self->find_template($c);
     my %global_args = $self->template_vars($c);
     my $output = $self->render($c, $template, +{%global_args, %template_args});
-    $self->set_response_from($c,$output);
+    $self->set_response_from($c, $output);
     return $self;
   } else {
     return $self;
@@ -156,44 +149,41 @@ sub apply_layout {
 
 sub find_layout {
   my ($self, $c) = @_;
-  return delete $c->stash->{'view.layout'} if exists $c->stash->{'view.layout'};
-  return;
+  return exists $c->stash->{'view.layout'} ? delete $c->stash->{'view.layout'} : undef;
 }
 
-our %CACHE = ();
 sub render_template {
   my ($self, $c, $template, $template_args) = @_;
   $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
 
-  my $local_mojo_template = $CACHE{$template} ||= do {
-    my $mojo_template = $self->_mojo_template;
-    my $local_mojo_template = bless +{%$mojo_template}, ref($mojo_template);
+  my $mojo_template = $self->{"__mojo_template_${template}"} ||= do {
+    my $mojo_template = $self->build_mojo_template;
+    $mojo_template->name($template);
 
-    $local_mojo_template->name($template);
     my $namespace_part = $template;
     $namespace_part =~s/\//::/g;
-    $namespace_part =~s/\.mt$//;
-    $local_mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part);
-    
-    my $template_full_path = $self->path_base->file($template);
-    $c->log->debug(qq/Found template at path "$template_full_path"/) if $c->debug;
-    my $template_contents = $template_full_path->slurp;
+    $namespace_part =~s/\.ep$//;
+    $mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part);
 
-    $local_mojo_template->parse($template_contents);
+    my $template_full_path = $self->path_base->file($template);
+    my $template_contents = $template_full_path->slurp;
+    $c->log->debug(qq/Found template at path "$template_full_path"/) if $c->debug;
+
+    my $output = $mojo_template->parse($template_contents);
   };
 
-  my $ns = $local_mojo_template->namespace;
+  my $ns = $mojo_template->namespace;
   
   no strict 'refs';
   no warnings 'redefine';
   local *{"${ns}::_C"} = sub { $c };
 
-  unless($self->{"__helper_${ns}"}) {
+  unless($self->{"__mojo_helper_${ns}"}) {
     $self->inject_helpers($c, $ns);
-    $self->{"__helper_${ns}"}++;
+    $self->{"__mojo_helper_${ns}"}++;
   }
 
-  return my $output = $local_mojo_template->process($template_args);
+  return my $output = $mojo_template->process($template_args);
 }
 
 sub inject_helpers {
@@ -211,7 +201,7 @@ sub template_vars {
   my ($self, $c) = @_;
   my %template_args = (
     base => $c->req->base,
-    name => $c->config->{name} ||'',
+    name => $c->config->{name} || '',
     model => $c->model,
     self => $self,
     %{$c->stash||+{}},
@@ -301,7 +291,7 @@ Then called from a controller:
 
       sub profile :Chained(root) PathPart(profile) Args(0) {
         my ($self, $c) = @_;
-        $c->view('HTML' => 'profile.mt', +{ 
+        $c->view('HTML' => 'profile.ep', +{ 
           me => $c->user,
         });
       }
@@ -412,7 +402,7 @@ The following is a list of the default helpers.
 
 =head2 layout
 
-    % layout "layout.mt", title => "Hello";
+    % layout "layout.ep", title => "Hello";
     <h1>The Awesome new Content</h1>
     <p>You are doomed to discover you can never recover from the narcoleptic
     country in which you once stood, where the fires alway burning but there's
@@ -437,7 +427,7 @@ Similar to the C<layout> helper, the C<wrapper> helper wraps the contained conte
 inside a another template.  However unlike C<layout> you can have more than one
 C<wrapper> in your template.  Example:
 
-    %= wrapper "wrapper.mt", header => "The Story Begins...", begin
+    %= wrapper "wrapper.ep", header => "The Story Begins...", begin
       <p>
         The story begins like many others; something interesting happend to someone
         while sone other sort of interesting thing was happening all over.  And then

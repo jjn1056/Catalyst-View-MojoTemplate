@@ -1,5 +1,5 @@
-% layout "layout.mt", title => "Hello";
-%= include "navbar.mt", myapp => "Example";
+% layout "layout.ep", title => "Hello";
+%= include "navbar.ep", myapp => "Example";
 this is a testdd
 <%= $test %>
 ggg
@@ -9,10 +9,6 @@ this <b>is</b> content <%= $test %>
 % end;
 
 <hr>
-
-%= form $person, begin
-  %= input 'name';
-% end
 
 %= now;
 %= `ps -o rss= -p $$`

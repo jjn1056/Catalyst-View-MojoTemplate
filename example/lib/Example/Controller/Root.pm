@@ -23,7 +23,7 @@ sub root :Chained(/) PathPart('') CaptureArgs(0) {}
 
   sub profile :Chained(root) PathPart(profile) Args(0) {
     my ($self, $c) = @_;
-    $c->view('HTML' => 'profile.mt', +{ 
+    $c->view('HTML' => 'profile.ep', +{ 
       aaa => 100,
     });
   }
