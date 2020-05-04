@@ -40,6 +40,7 @@ has _mojo_template => (
 
   sub _build_mojo_template {
     my $self = shift;
+    my $prepend = 'my $c = _C;' . $self->prepend;
     my %args = (
       auto_escape => $self->auto_escape,
       append => $self->append,
@@ -50,12 +51,13 @@ has _mojo_template => (
       escape_mark => $self->escape_mark,
       expression_mark => $self->expression_mark,
       line_start => $self->line_start,
-      prepend => $self->prepend,
+      prepend => $prepend,
       trim_mark => $self->trim_mark,
       tag_start => $self->tag_start,
       tag_end => $self->tag_end,
       vars => 1,
     );
+
     return Mojo::Template->new(%args);
   }
 
@@ -93,6 +95,7 @@ sub ACCEPT_CONTEXT {
     my %global_args = $self->template_vars($c);
     my $output = $self->render($c, $template, +{%global_args, %template_args});
     $self->set_response_from($c,$output);
+
     return $self;
   } else {
     return $self;
@@ -163,7 +166,7 @@ sub render_template {
   my ($self, $c, $template, $template_args) = @_;
   $c->log->debug(qq/Rendering template "$template"/) if $c->debug;
 
-  my $local_mojo_template = $CACHE{$template} = do {
+  my $local_mojo_template = $CACHE{$template} ||= do {
     my $mojo_template = $self->_mojo_template;
     my $local_mojo_template = bless +{%$mojo_template}, ref($mojo_template);
 
@@ -171,10 +174,8 @@ sub render_template {
     my $namespace_part = $template;
     $namespace_part =~s/\//::/g;
     $namespace_part =~s/\.mt$//;
-    $local_mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part );
-
-    $self->inject_helpers($c,$local_mojo_template->namespace);
-
+    $local_mojo_template->namespace( ref($self) .'::Sandbox::'. $namespace_part);
+    
     my $template_full_path = $self->path_base->file($template);
     $c->log->debug(qq/Found template at path "$template_full_path"/) if $c->debug;
     my $template_contents = $template_full_path->slurp;
@@ -182,13 +183,20 @@ sub render_template {
     $local_mojo_template->parse($template_contents);
   };
 
-  my $output = $local_mojo_template->process($template_args);
+  my $ns = $local_mojo_template->namespace;
+  $self->inject_context($c, $ns);
+  $self->inject_helpers($c, $ns) unless $self->{"__helper_${ns}"};
+  $self->{"__helper_${ns}"}++;
 
-  return $output;
+  return my $output = $local_mojo_template->process($template_args);
 }
 
-# Its possible we need to do this upfront caching at init time.  I think
-# This way we end up building a new cache when a fork is initialized.
+sub inject_context {
+  my($self, $c, $namespace) = @_;
+  no strict 'refs';
+  no warnings 'redefine';
+  local *{"${namespace}::_C"} = sub {$c};
+}
 
 sub inject_helpers {
   my ($self, $c, $namespace) = @_;
@@ -198,7 +206,7 @@ sub inject_helpers {
     $c->log->debug(qq/Injecting helper "$helper"/) if $c->debug;
     eval qq[
       package $namespace;
-      sub $helper { \$self->get_helpers('$helper')->(\$self, \$c, \@_) }
+      sub $helper { \$self->get_helpers('$helper')->(\$self, _C, \@_) }
     ]; die $@ if $@;
   }
 }
@@ -206,7 +214,6 @@ sub inject_helpers {
 sub template_vars {
   my ($self, $c) = @_;
   my %template_args = (
-    c => $c,
     base => $c->req->base,
     name => $c->config->{name} ||'',
     model => $c->model,
@@ -223,8 +230,14 @@ sub default_helpers {
     layout => sub {
       my ($self, $c, $template, %args) = @_;
       $c->stash('view.layout' => $template);
-      #$c->stash->{'view.content'}
       $c->stash(%args) if %args;
+    },
+    wrapper => sub {
+      my ($self, $c, $template, @args) = @_;
+      $c->stash->{'view.content'}->{main} = pop @args;
+      my %local_args = @args;
+      my %global_args = $self->template_vars($c);
+      return b($self->render_template($c, $template, +{ %global_args, %local_args }));
     },
     include => sub {
       my ($self, $c, $template, %args) = @_;
@@ -240,6 +253,28 @@ sub default_helpers {
         || die "No content key named '$name'";
 
       return (ref($value)||'') eq 'CODE' ? $value->() : $value;
+    },
+    form => sub {
+      my ($self, $c, $model, @proto) = @_;
+      my ($inner, %attrs) = (pop(@proto), @proto);
+      my $attrs =  join ' ', map { "$_='$attrs{$_}'"} keys %attrs;
+
+      LOCAL_TO_FORM: {
+        # Do we need a stack so we can refer to the parent or not...?
+        my @model_stack = (
+          (exists($c->stash->{'view.form.model'}) ? $c->stash->{'view.form.model'} : () ),
+          $model,
+        );
+        local $c->stash->{'view.form.model'} = $model;
+
+      return b("<form $attrs>@{[$inner->()]}</form>");
+      }
+    },
+    input => sub {
+      my ($self, $c, $name, %attrs) = @_;
+      $attrs{value} = $c->stash->{'view.form.model'}->{$name};
+      my $attrs =  join ' ', map { "$_='$attrs{$_}'"} keys %attrs;
+      return b("<input $attrs/>");
     },
   );
 }
