@@ -6,7 +6,7 @@ use Mojo::ByteStream qw(b);
 
 extends 'Catalyst::View';
 
-our $VERSION = 0.003;
+our $VERSION = 0.004;
 
 has app => (is=>'ro');
 has auto_escape => (is=>'ro', required=>1, default=>1);
@@ -233,7 +233,7 @@ sub default_helpers {
       my ($self, $c, $name, $proto) = @_;
 
       $name ||= 'main';
-      $c->stash->{'view.content'}->{$name} = _block($proto) if $proto && !exist($c->stash->{'view.content'}->{$name});
+      $c->stash->{'view.content'}->{$name} = _block($proto) if $proto && !exists($c->stash->{'view.content'}->{$name});
 
       my $value = $c->stash->{'view.content'}->{$name};
       $value = '' unless defined($value);
